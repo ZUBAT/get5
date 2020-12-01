@@ -1,3 +1,5 @@
+#include <string>
+
 #define REMOTE_CONFIG_PATTERN "remote_config%d.json"
 #define CONFIG_MATCHID_DEFAULT "matchid"
 #define CONFIG_MATCHTITLE_DEFAULT "Map {MAPNUMBER} of {MAXMAPS}"
@@ -22,10 +24,10 @@ stock bool LoadMatchConfig(const char[] config, bool restoreBackup = false) {
     g_TeamGivenStopCommand[team] = false;
     g_TeamPauseTimeUsed[team] = 0;
     g_TeamPausesUsed[team] = 0;
-    g_ReadyTimeWaitingUsed[team] = 0;
     ClearArray(GetTeamAuths(team));
   }
 
+  g_ReadyTimeWaitingUsed = 0;
   g_ForceWinnerSignal = false;
   g_ForcedWinner = MatchTeam_TeamNone;
 
@@ -113,6 +115,8 @@ stock bool LoadMatchConfig(const char[] config, bool restoreBackup = false) {
 
     EventLogger_SeriesStart();
     Stats_InitSeries();
+
+    LogDebug("Calling Get5_OnSeriesInit");
     Call_StartForward(g_OnSeriesInit);
     Call_Finish();
   }
@@ -120,7 +124,7 @@ stock bool LoadMatchConfig(const char[] config, bool restoreBackup = false) {
   for (int i = 1; i <= MaxClients; i++) {
     if (IsAuthedPlayer(i)) {
       if (GetClientMatchTeam(i) == MatchTeam_TeamNone) {
-        KickClient(i, "%t", "YourAreNotAPlayerInfoMessage");
+        RememberAndKickClient(i, "%t", "YourAreNotAPlayerInfoMessage");
       } else {
         CheckClientTeam(i);
       }
@@ -137,6 +141,7 @@ stock bool LoadMatchConfig(const char[] config, bool restoreBackup = false) {
 }
 
 public bool LoadMatchFile(const char[] config) {
+  LogDebug("Calling Get5_OnPreLoadMatchConfig(config=%s)", config);
   Call_StartForward(g_OnPreLoadMatchConfig);
   Call_PushString(config);
   Call_Finish();
@@ -186,6 +191,7 @@ static void MatchConfigFail(const char[] reason, any...) {
 
   EventLogger_MatchConfigFail(buffer);
 
+  LogDebug("Calling Get5_OnLoadMatchConfigFailed(reason=%s)", buffer);
   Call_StartForward(g_OnLoadMatchConfigFailed);
   Call_PushString(buffer);
   Call_Finish();
@@ -195,14 +201,15 @@ stock bool LoadMatchFromUrl(const char[] url, ArrayList paramNames = null,
                             ArrayList paramValues = null) {
   bool steamWorksAvaliable = LibraryExists("SteamWorks");
 
+
   char cleanedUrl[1024];
   strcopy(cleanedUrl, sizeof(cleanedUrl), url);
   ReplaceString(cleanedUrl, sizeof(cleanedUrl), "\"", "");
+  strcopy(g_LoadedConfigUrl, sizeof(g_LoadedConfigUrl), cleanedUrl);
 
   if (steamWorksAvaliable) {
-    // Add the protocl strings. Only allow http since SteamWorks doesn't support http it seems?
-    ReplaceString(cleanedUrl, sizeof(cleanedUrl), "https://", "http://");
-    if (StrContains(cleanedUrl, "http://") == -1) {
+    // Add the protocol strings if missing (only http).
+    if (StrContains(cleanedUrl, "http://") == -1 && StrContains(cleanedUrl, "https://") == -1) {
       Format(cleanedUrl, sizeof(cleanedUrl), "http://%s", cleanedUrl);
     }
     LogDebug("cleanedUrl (SteamWorks) = %s", cleanedUrl);
@@ -249,6 +256,8 @@ public int SteamWorks_OnMatchConfigReceived(Handle request, bool failure, bool r
   GetTempFilePath(remoteConfig, sizeof(remoteConfig), REMOTE_CONFIG_PATTERN);
   SteamWorks_WriteHTTPResponseBodyToFile(request, remoteConfig);
   LoadMatchConfig(remoteConfig);
+
+  strcopy(g_LoadedConfigFile, sizeof(g_LoadedConfigFile), g_LoadedConfigUrl);
 }
 
 public void WriteMatchToKv(KeyValues kv) {
@@ -511,20 +520,17 @@ static bool LoadMatchFromJson(JSON_Object json) {
   }
 
   if (g_SkipVeto) {
-    JSON_Object array = json.GetObject("map_sides");
+    JSON_Array array = view_as<JSON_Array>(json.GetObject("map_sides"));
     if (array != null) {
       if (!array.IsArray) {
         MatchConfigFail("Expected \"map_sides\" section to be an array");
         return false;
       }
       for (int i = 0; i < array.Length; i++) {
-        char keyAsString[64];
         char buffer[64];
-        array.GetIndexString(keyAsString, sizeof(keyAsString), i);
-        array.GetString(keyAsString, buffer, sizeof(buffer));
+        array.GetString(i, buffer, sizeof(buffer));
         g_MapSides.Push(SideTypeFromString(buffer));
       }
-      CloseHandle(array);
     }
   }
 
@@ -545,7 +551,6 @@ static bool LoadMatchFromJson(JSON_Object json) {
       g_CvarNames.PushString(cvarName);
       g_CvarValues.PushString(cvarValue);
     }
-
   }
 
   return true;
@@ -617,6 +622,16 @@ static void LoadDefaultMapList(ArrayList list) {
   list.PushString("de_nuke");
   list.PushString("de_overpass");
   list.PushString("de_train");
+  
+  if (g_SkipVeto) {
+    char currentMap[PLATFORM_MAX_PATH];
+    GetCurrentMap(currentMap, sizeof(currentMap));
+
+    int currentMapIndex = list.FindString(currentMap);
+    if (currentMapIndex > 0) {
+      list.SwapAt(0, currentMapIndex);
+    }
+  }
 }
 
 public void SetMatchTeamCvars() {
@@ -791,6 +806,54 @@ public Action Command_AddPlayer(int client, int args) {
   return Plugin_Handled;
 }
 
+public Action Command_AddKickedPlayer(int client, int args) {
+  if (g_GameState == Get5State_None) {
+    ReplyToCommand(client, "Cannot change player lists when there is no match to modify");
+    return Plugin_Handled;
+  }
+
+  if (g_InScrimMode) {
+    ReplyToCommand(
+        client, "Cannot use get5_addkickedplayer in scrim mode. Use get5_ringer to swap a players team.");
+    return Plugin_Handled;
+  }
+
+  if (StrEqual(g_LastKickedPlayerAuth, "")) {
+    ReplyToCommand(client, "No player has been kicked yet.");
+    return Plugin_Handled;
+  }
+
+  char teamString[32];
+  char name[MAX_NAME_LENGTH];
+  if (args >= 1 && GetCmdArg(1, teamString, sizeof(teamString))) {
+    if (args >= 2) {
+      GetCmdArg(2, name, sizeof(name));
+    }
+
+    MatchTeam team = MatchTeam_TeamNone;
+    if (StrEqual(teamString, "team1")) {
+      team = MatchTeam_Team1;
+    } else if (StrEqual(teamString, "team2")) {
+      team = MatchTeam_Team2;
+    } else if (StrEqual(teamString, "spec")) {
+      team = MatchTeam_TeamSpec;
+    } else {
+      ReplyToCommand(client, "Unknown team: must be one of team1, team2, spec");
+      return Plugin_Handled;
+    }
+
+    if (AddPlayerToTeam(g_LastKickedPlayerAuth, team, name)) {
+      ReplyToCommand(client, "Successfully added kicked player %s to team %s", g_LastKickedPlayerAuth, teamString);
+    } else {
+      ReplyToCommand(client, "Player %s is already on a match team.", g_LastKickedPlayerAuth);
+    }
+
+  } else {
+    ReplyToCommand(client, "Usage: get5_addkickedplayer <team1|team2|spec> [name]");
+  }
+  return Plugin_Handled;
+}
+
 public Action Command_RemovePlayer(int client, int args) {
   if (g_GameState == Get5State_None) {
     ReplyToCommand(client, "Cannot change player lists when there is no match to modify");
@@ -813,6 +876,32 @@ public Action Command_RemovePlayer(int client, int args) {
     }
   } else {
     ReplyToCommand(client, "Usage: get5_removeplayer <auth>");
+  }
+  return Plugin_Handled;
+}
+
+public Action Command_RemoveKickedPlayer(int client, int args) {
+  if (g_GameState == Get5State_None) {
+    ReplyToCommand(client, "Cannot change player lists when there is no match to modify");
+    return Plugin_Handled;
+  }
+
+  if (g_InScrimMode) {
+    ReplyToCommand(
+        client,
+        "Cannot use get5_removekickedplayer in scrim mode. Use get5_ringer to swap a players team.");
+    return Plugin_Handled;
+  }
+
+  if (StrEqual(g_LastKickedPlayerAuth, "")) {
+    ReplyToCommand(client, "No player has been kicked yet.");
+    return Plugin_Handled;
+  }
+
+  if (RemovePlayerFromTeams(g_LastKickedPlayerAuth)) {
+    ReplyToCommand(client, "Successfully removed kicked player %s", g_LastKickedPlayerAuth);
+  } else {
+    ReplyToCommand(client, "Player %s not found in auth lists.", g_LastKickedPlayerAuth);
   }
   return Plugin_Handled;
 }
